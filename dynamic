@@ -1,0 +1,332 @@
+import numpy as np
+import lightgbm as lgb
+from sklearn.preprocessing import StandardScaler
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import mean_squared_error
+import matplotlib.pyplot as plt
+import pandas as pd
+import joblib
+import os
+from typing import Tuple, List
+
+
+class LightGBMTorquePredictor:
+    def __init__(self):
+        self.models: List[lgb.Booster] = []
+        self.scaler_X = StandardScaler()
+        self.scaler_y = StandardScaler()
+        self.feature_names: List[str] = []
+        self.is_fitted = False
+        self.n_joints = 6
+
+    def load_csv_data(self, angle_path: str, velocity_path: str, 
+                     acceleration_path: str, torque_path: str) -> Tuple[pd.DataFrame, pd.DataFrame]:
+        """
+        Load and validate data from CSV files
+        
+        Args:
+            angle_path: Path to joint angles CSV
+            velocity_path: Path to joint velocities CSV
+            acceleration_path: Path to joint accelerations CSV
+            torque_path: Path to joint torques CSV
+            
+        Returns:
+            Tuple of (features DataFrame, targets DataFrame)
+        """
+        try:
+            data_files = {
+                'angles': angle_path,
+                'velocities': velocity_path,
+                'accelerations': acceleration_path,
+                'torques': torque_path
+            }
+            
+            # Load all data files
+            loaded_data = {}
+            for name, path in data_files.items():
+                if not os.path.exists(path):
+                    raise FileNotFoundError(f"File not found: {path}")
+                loaded_data[name] = pd.read_csv(path, header=None)
+
+            # Validate data dimensions
+            expected_shape = (self.n_joints, 200)
+            for name, data in loaded_data.items():
+                if data.shape != expected_shape:
+                    raise ValueError(
+                        f"{name} data has incorrect dimensions. "
+                        f"Expected {expected_shape}, got {data.shape}"
+                    )
+
+            # Generate feature names
+            self.feature_names = []
+            prefixes = ['angle', 'velocity', 'acceleration']
+            for prefix in prefixes:
+                self.feature_names.extend([f"{prefix}_{i+1}" for i in range(self.n_joints)])
+
+            # Combine input features
+            X = pd.concat([
+                loaded_data['angles'].add_prefix('angle_'),
+                loaded_data['velocities'].add_prefix('velocity_'),
+                loaded_data['accelerations'].add_prefix('acceleration_')
+            ], axis=1)
+
+            y = loaded_data['torques'].add_prefix('torque_')
+
+            return X, y
+
+        except Exception as e:
+            raise Exception(f"Error in data loading: {str(e)}")
+
+    def prepare_data(self, X: pd.DataFrame, y: pd.DataFrame, 
+                    test_size: float = 0.2, random_state: int = 42) -> Tuple:
+        """
+        Prepare data for training by splitting into train and validation sets
+        
+        Args:
+            X: Feature DataFrame
+            y: Target DataFrame
+            test_size: Proportion of data to use for validation
+            random_state: Random seed for reproducibility
+            
+        Returns:
+            Tuple of (X_train, X_val, y_train, y_val)
+        """
+        return train_test_split(X, y, test_size=test_size, random_state=random_state)
+
+    def train(self, x_train: np.ndarray, y_train: np.ndarray, 
+              x_val: np.ndarray, y_val: np.ndarray) -> List[float]:
+        """
+        Train models - one for each joint
+        
+        Args:
+            x_train: Training features
+            y_train: Training targets
+            x_val: Validation features
+            y_val: Validation targets
+            
+        Returns:
+            List of validation scores for each joint
+        """
+        # Convert to numpy arrays if needed
+        x_train = np.array(x_train)
+        y_train = np.array(y_train)
+        x_val = np.array(x_val)
+        y_val = np.array(y_val)
+
+        # Scale the data
+        x_train_scaled = self.scaler_X.fit_transform(x_train)
+        x_val_scaled = self.scaler_X.transform(x_val)
+        y_train_scaled = self.scaler_y.fit_transform(y_train)
+        y_val_scaled = self.scaler_y.transform(y_val)
+
+        params = {
+            'objective': 'regression',
+            'metric': 'mse',
+            'num_leaves': 31,
+            'learning_rate': 0.05,
+            'feature_fraction': 0.9,
+            'bagging_fraction': 0.8,
+            'bagging_freq': 5,
+            'verbose': -1
+        }
+
+        val_scores = []
+        self.models = []
+
+        for joint in range(self.n_joints):
+            print(f"Training model for joint {joint + 1}")
+
+            train_data = lgb.Dataset(
+                x_train_scaled,
+                y_train_scaled[:, joint],
+                feature_name=self.feature_names
+            )
+            val_data = lgb.Dataset(
+                x_val_scaled,
+                y_val_scaled[:, joint],
+                reference=train_data
+            )
+
+            model = lgb.train(
+                params,
+                train_data,
+                num_boost_round=1000,
+                valid_sets=[val_data],
+                callbacks=[lgb.early_stopping(20), lgb.log_evaluation(100)]
+            )
+
+            self.models.append(model)
+
+            # Calculate validation score in original scale
+            val_pred_scaled = model.predict(x_val_scaled)
+            val_pred = self.scaler_y.inverse_transform(
+                np.column_stack([val_pred_scaled if i == joint else np.zeros_like(val_pred_scaled)
+                               for i in range(self.n_joints)])
+            )[:, joint]
+            val_score = mean_squared_error(y_val[:, joint], val_pred, squared=False)
+            val_scores.append(val_score)
+
+        self.is_fitted = True
+        return val_scores
+
+    def predict_torques(self, joint_angles: np.ndarray) -> np.ndarray:
+        """
+        Predict joint torques
+        
+        Args:
+            joint_angles: Input joint angles array
+            
+        Returns:
+            Predicted torques array
+        """
+        if not self.is_fitted:
+            raise ValueError("Model is not fitted. Please train the model first.")
+
+        if not isinstance(joint_angles, np.ndarray):
+            joint_angles = np.array(joint_angles)
+
+        x_scaled = self.scaler_X.transform(joint_angles)
+        predictions = np.zeros((joint_angles.shape[0], self.n_joints))
+
+        for joint, model in enumerate(self.models):
+            predictions[:, joint] = model.predict(x_scaled)
+
+        return self.scaler_y.inverse_transform(predictions)
+
+    def analyze_feature_importance(self) -> np.ndarray:
+        """
+        Analyze feature importance for each joint
+        
+        Returns:
+            Array of feature importance scores
+        """
+        if not self.is_fitted:
+            raise ValueError("Model is not fitted. Please train the model first.")
+
+        n_features = len(self.feature_names)
+        feature_importance = np.zeros((self.n_joints, n_features))
+
+        for i, model in enumerate(self.models):
+            importance = model.feature_importance(importance_type='gain')
+            feature_importance[i] = importance
+
+        return feature_importance
+
+    def plot_feature_importance(self, feature_importance: np.ndarray) -> None:
+        """
+        Visualize feature importance
+        
+        Args:
+            feature_importance: Feature importance array from analyze_feature_importance()
+        """
+        plt.figure(figsize=(15, 10))
+        joint_names = [f'Joint {i+1}' for i in range(self.n_joints)]
+        
+        plt.imshow(feature_importance, cmap='YlOrRd', aspect='auto')
+        plt.xticks(range(len(self.feature_names)), self.feature_names, rotation=45, ha='right')
+        plt.yticks(range(self.n_joints), joint_names)
+        plt.colorbar(label='Feature Importance')
+        plt.xlabel('Input Features')
+        plt.ylabel('Output Joints')
+        plt.title('Feature Importance Heatmap')
+        plt.tight_layout()
+        plt.show()
+
+    def save_model(self, save_dir: str) -> None:
+        """
+        Save model to directory
+        
+        Args:
+            save_dir: Directory path to save model files
+        """
+        if not self.is_fitted:
+            raise ValueError("Cannot save an unfitted model")
+
+        os.makedirs(save_dir, exist_ok=True)
+
+        # Save scalers
+        joblib.dump(self.scaler_X, os.path.join(save_dir, 'scaler_X.pkl'))
+        joblib.dump(self.scaler_y, os.path.join(save_dir, 'scaler_y.pkl'))
+
+        # Save models
+        for i, model in enumerate(self.models):
+            model.save_model(os.path.join(save_dir, f'joint_{i+1}_model.txt'))
+
+        print(f"Model saved to {save_dir}")
+
+    def load_model(self, model_dir: str) -> None:
+        """
+        Load model from directory
+        
+        Args:
+            model_dir: Directory path containing model files
+        """
+        if not os.path.exists(model_dir):
+            raise FileNotFoundError(f"Model directory not found: {model_dir}")
+
+        try:
+            # Load scalers
+            self.scaler_X = joblib.load(os.path.join(model_dir, 'scaler_X.pkl'))
+            self.scaler_y = joblib.load(os.path.join(model_dir, 'scaler_y.pkl'))
+
+            # Load models
+            self.models = []
+            for i in range(self.n_joints):
+                model_path = os.path.join(model_dir, f'joint_{i+1}_model.txt')
+                if not os.path.exists(model_path):
+                    raise FileNotFoundError(f"Model file not found: {model_path}")
+                model = lgb.Booster(model_file=model_path)
+                self.models.append(model)
+
+            self.is_fitted = True
+            print(f"Model loaded from {model_dir}")
+        except Exception as e:
+            raise Exception(f"Error loading model: {str(e)}")
+
+
+if __name__ == "__main__":
+    try:
+        # Create predictor instance
+        predictor = LightGBMTorquePredictor()
+
+        # Load data
+        data_paths = {
+            'angle_path': r"C:\Users\GD003\Desktop\MATLAB\data\ang_data.csv",
+            'velocity_path': r"C:\Users\GD003\Desktop\MATLAB\data\dq_data.csv",
+            'acceleration_path': r"C:\Users\GD003\Desktop\MATLAB\data\ddq_data.csv",
+            'torque_path': r"C:\Users\GD003\Desktop\MATLAB\data\tor_data.csv"
+        }
+
+        joint_angles, torques = predictor.load_csv_data(**data_paths)
+        print(f"Loaded data shape - Joint angles: {joint_angles.shape}, Torques: {torques.shape}")
+
+        # Prepare data
+        x_train, x_val, y_train, y_val = predictor.prepare_data(joint_angles, torques)
+
+        # Train model
+        val_scores = predictor.train(x_train, y_train, x_val, y_val)
+        print("\nValidation RMSE for each joint:")
+        for joint, score in enumerate(val_scores):
+            print(f"Joint {joint + 1}: {score:.4f}")
+
+        # Example prediction
+        test_angles = x_val[0:1]
+        predicted_torques = predictor.predict_torques(test_angles)
+        print("\nPredicted torques for first validation sample:")
+        print(predicted_torques[0])
+
+        # Analyze and visualize feature importance
+        feature_importance = predictor.analyze_feature_importance()
+        predictor.plot_feature_importance(feature_importance)
+
+        # Save model
+        save_dir = r"D:\pycharm\learn\mechanical_learning\saved_model"
+        predictor.save_model(save_dir)
+
+    except FileNotFoundError as e:
+        print(f"File not found error: {str(e)}")
+    except ValueError as e:
+        print(f"Value error: {str(e)}")
+    except Exception as e:
+        print(f"Unexpected error: {str(e)}")
+        raise
